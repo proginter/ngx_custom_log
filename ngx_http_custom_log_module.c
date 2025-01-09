@@ -407,16 +407,6 @@ static ngx_int_t ngx_http_custom_log_handler(ngx_http_request_t *r) {
         username_value.len = 0;
     }
 
-    /* Get the sub */
-    ngx_str_t sub;
-    ngx_str_set(&sub, "sub");
-
-    ngx_str_t sub_value;
-    ngx_str_set(&sub_value, "sub");
-    if (ngx_http_custom_log_get_variable(r, &sub, &sub_value) != NGX_OK) {
-        sub_value.len = 0;
-    }
-
     /* Get the request_platform */
     ngx_str_t request_platform;
     ngx_str_set(&request_platform, "request_platform");
@@ -591,20 +581,14 @@ static ngx_int_t ngx_http_custom_log_handler(ngx_http_request_t *r) {
 
     if (username_value.len > 0) {
         ngx_str_set(&log_folder, "/proginter/config/users/");
-
-        if (sub_value.len > 0) {
-            ngx_str_set(&log_format, "/domain/subs/%V/logs/last/%V.log");
-        }
-        else {
-            ngx_str_set(&log_format, "/logs/last/%V.log");
-        }
+    	ngx_str_set(&log_format, "/logs/last/%V.log");
     } else {
         ngx_str_set(&log_folder, "/var/log/nginx/");
         ngx_str_set(&log_format, "/%V.log");
     }
     
-    log_filename.data = ngx_pnalloc(r->pool, log_folder.len + username_value.len + log_format.len + type.len + sub_value.len);
-    ngx_memzero(log_filename.data,log_folder.len + username_value.len + log_format.len + type.len + sub_value.len);
+    log_filename.data = ngx_pnalloc(r->pool, log_folder.len + username_value.len + log_format.len + type.len);
+    ngx_memzero(log_filename.data,log_folder.len + username_value.len + log_format.len + type.len);
     if (log_filename.data == NULL) {
         return NGX_ERROR;
     }
@@ -614,12 +598,8 @@ static ngx_int_t ngx_http_custom_log_handler(ngx_http_request_t *r) {
         ngx_memcpy(log_filename.data + log_folder.len, username_value.data, username_value.len);
     }
 
-    if (sub_value.len == 0) {
-        ngx_sprintf(log_filename.data + log_folder.len + username_value.len, (char *) log_format.data, &type);
-    }
-    else {
-        ngx_sprintf(log_filename.data + log_folder.len + username_value.len, (char *) log_format.data, &sub_value, &type);
-    }
+    ngx_sprintf(log_filename.data + log_folder.len + username_value.len, (char *) log_format.data, &type);
+	    
     log_filename.len = ngx_strlen(log_filename.data);
 
     log_shared_info_t node;
