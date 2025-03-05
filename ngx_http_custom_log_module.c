@@ -260,6 +260,11 @@ static ngx_int_t ngx_http_custom_log_handler(ngx_http_request_t *r)
     (void) ngx_http_custom_log_get_variable(r, &upstream_cache,   &upstream_cache_val);
     (void) ngx_http_custom_log_get_variable(r, &challenge_type,   &challenge_type_val);
 
+      if (challenge_type_val.len == 0) {
+        static ngx_str_t default_challenge_type = ngx_string("dynamic");
+        challenge_type_val = default_challenge_type;
+    }
+
     // referer / user-agent
     ngx_str_t referer_value    = ngx_null_string;
     ngx_str_t user_agent_value = ngx_null_string;
