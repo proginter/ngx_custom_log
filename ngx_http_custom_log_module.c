@@ -324,11 +324,18 @@ static ngx_int_t ngx_http_custom_log_handler(ngx_http_request_t *r)
 
     // if you want to wrap custom_data: "value"-
     if (llcf->custom_data.len > 0) {
-        unsigned char custom_tmp[OTHER_CUSTOM_DATA_LEN_LIMIT + 1];
-        ngx_memzero(custom_tmp, sizeof(custom_tmp));
-        ngx_sprintf(custom_tmp, "%V\"-\"", &llcf->custom_data);
-        llcf->custom_data.len  = ngx_strlen(custom_tmp);
-        llcf->custom_data.data = custom_tmp;
+        // Allocate enough bytes from r->pool: original length + 3 for "\"-\"" + null-terminator
+        size_t needed = llcf->custom_data.len + 3 + 1;
+        u_char *p = ngx_pnalloc(r->pool, needed);
+        if (p == NULL) {
+            return NGX_ERROR; // handle allocation error
+        }
+    
+        ngx_memzero(p, needed);
+        ngx_sprintf(p, "%V\"-\"", &llcf->custom_data);
+    
+        llcf->custom_data.len  = ngx_strlen(p);
+        llcf->custom_data.data = p;
     }
 
     // build log line
