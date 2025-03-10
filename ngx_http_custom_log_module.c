@@ -3,76 +3,100 @@
 #include <ngx_http.h>
 #include <pthread.h>
 #include <netinet/in.h>
-#include <unistd.h>    // for sleep()
 #include <stdlib.h>
 #include <string.h>
 
 #ifndef LOG_IF_LUA_SUPPORT
 #define LOG_IF_LUA_SUPPORT
 #endif
+
 #ifdef LOG_IF_LUA_SUPPORT
 #include <lauxlib.h>
 #include "ngx_http_lua_api.h"
 #endif
 
-// --------------- Constants ---------------
-#define MAX_LOG_LINE_LEN               4096
-#define HEADER_USER_AGENT_LEN_LIMIT    350
-#define HEADER_UNPARSED_URI_LEN_LIMIT  350
-#define METHOD_NAME_LEN_LIMIT          20
-#define OTHER_CUSTOM_DATA_LEN_LIMIT    100
-#define HEADER_REFRERER_LEN_LIMIT      100
-#define LOG_FILENAME_MAX_LEN           1024   // Increased size for filename path
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+#define MAX_LOG_LINE_LEN             4096
+#define HEADER_USER_AGENT_LEN_LIMIT  350
+#define HEADER_UNPARSED_URI_LEN_LIMIT 350
+#define METHOD_NAME_LEN_LIMIT        20
+#define OTHER_CUSTOM_DATA_LEN_LIMIT  100
+#define HEADER_REFRERER_LEN_LIMIT    100
 
-// --------------- Module Location Conf ---------------
+// How big the list can grow before forcing a flush
+#define MAX_LIST_BUFFER_SIZE         100
+
+// How many milliseconds to wait before forcing a flush even if list is smaller
+#define LIST_BUFFER_FLUSH_DEPLAY_MS  1000
+
+// -----------------------------------------------------------------------------
+// Location Config
+// -----------------------------------------------------------------------------
 typedef struct {
-    ngx_str_t  type;
-    ngx_str_t  custom_data;
-    int        lua;  // track if set via Lua
+    ngx_str_t type;         // log_type
+    ngx_str_t custom_data;
+    int       lua;          // indicates if set by Lua
 } ngx_http_custom_log_conf_t;
 
-// --------------- Queue Structures ---------------
-typedef struct log_queue_node_s {
-    u_char data[NGX_MAX_ERROR_STR];
-    u_char log_filename[LOG_FILENAME_MAX_LEN];
-    size_t datasize;
-    struct log_queue_node_s *next;
-} log_queue_node_t;
+// -----------------------------------------------------------------------------
+// Linked List / Shared Info Structures
+// -----------------------------------------------------------------------------
+typedef struct log_shared_info {
+    unsigned char data[NGX_MAX_ERROR_STR];
+    unsigned char log_filename[256];
+    size_t        datasize;
+    struct log_shared_info * volatile next;
+} log_shared_info_t;
 
 typedef struct {
-    ngx_pool_t       *pool;
-    log_queue_node_t *head;
-    log_queue_node_t *tail;
-    size_t            size;
-    pthread_mutex_t   mutex;
-    pthread_t         thread;
-    int               inited;
-    int               stopping;
-} log_queue_t;
+    int   inited;          // 1 = valid, 0 = not inited
+    log_shared_info_t *begin;
+    log_shared_info_t *end;
+    ngx_pool_t        *pool;
+    pthread_t          pid;
+    size_t             nodes_size;
+} log_shared_info_head_t;
 
-// --------------- Global Queue Pointer (per worker) ---------------
-static log_queue_t *g_queue = NULL;
-
-// --------------- Forward Declarations ---------------
-static void        *ngx_http_custom_log_create_loc_conf(ngx_conf_t *cf);
-static char        *ngx_http_custom_log_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child);
-static ngx_int_t    ngx_http_custom_log_handler(ngx_http_request_t *r);
-static ngx_int_t    ngx_http_custom_log_init(ngx_conf_t *cf);
-
-// For graceful shutdown:
-static void         ngx_http_custom_log_exit_process(ngx_cycle_t *cycle);
-
-static char        *ngx_http_custom_log_set_type(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
-static ngx_int_t    ngx_http_custom_log_get_variable(ngx_http_request_t *r, ngx_str_t *name, ngx_str_t *value);
-
-static unsigned char *FormattingCorrectionStrings(ngx_pool_t *pool, unsigned char *raw, size_t length);
-
-#ifdef LOG_IF_LUA_SUPPORT
-static int ngx_http_lua_custom_log_set_type(lua_State *L);
-static int ngx_http_lua_custom_log_register_function(lua_State *L);
+// -----------------------------------------------------------------------------
+// Global pointer to the shared list head
+// -----------------------------------------------------------------------------
+#if (NGX_THREADS)
+static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
-// --------------- Command Array ---------------
+static log_shared_info_head_t *head = NULL;
+
+// -----------------------------------------------------------------------------
+// Forward Declarations
+// -----------------------------------------------------------------------------
+static void             *ngx_http_custom_log_create_loc_conf(ngx_conf_t *cf);
+static char             *ngx_http_custom_log_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child);
+static ngx_int_t         ngx_http_custom_log_handler(ngx_http_request_t *r);
+static ngx_int_t         ngx_http_custom_log_init(ngx_conf_t *cf);
+static char             *ngx_http_custom_log_set_type(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static ngx_int_t         ngx_http_custom_log_get_variable(ngx_http_request_t *r, ngx_str_t *name, ngx_str_t *value);
+
+static void              ngx_log_fflush(log_shared_info_head_t *head);
+static log_shared_info_head_t *init_info_list(ngx_conf_t *cf, log_shared_info_head_t *head);
+static log_shared_info_head_t *add_info_list(log_shared_info_head_t *head, log_shared_info_t *node);
+static log_shared_info_head_t *del_info_list(log_shared_info_head_t *head, log_shared_info_t *node);
+
+static unsigned char    *FormattingCorrectionStrings(ngx_pool_t *pool, unsigned char *raw, size_t length);
+
+#ifdef LOG_IF_LUA_SUPPORT
+static int  ngx_http_lua_custom_log_set_type(lua_State * L);
+static int  ngx_http_lua_custom_log_register_function(lua_State * L);
+#endif
+
+#if (NGX_THREADS)
+static void *log_thread_func(void *data);
+#endif
+
+// -----------------------------------------------------------------------------
+// Module Directives
+// -----------------------------------------------------------------------------
 static ngx_command_t ngx_http_custom_log_commands[] = {
     {
         ngx_string("log_type"),
@@ -85,10 +109,12 @@ static ngx_command_t ngx_http_custom_log_commands[] = {
     ngx_null_command
 };
 
-// --------------- Module Context ---------------
+// -----------------------------------------------------------------------------
+// Module Context
+// -----------------------------------------------------------------------------
 static ngx_http_module_t ngx_http_custom_log_module_ctx = {
-    NULL,                        /* preconfiguration */
-    ngx_http_custom_log_init,    /* postconfiguration */
+    NULL,                         /* preconfiguration */
+    ngx_http_custom_log_init,     /* postconfiguration */
 
     NULL, /* create main configuration */
     NULL, /* init main configuration */
@@ -96,214 +122,357 @@ static ngx_http_module_t ngx_http_custom_log_module_ctx = {
     NULL, /* create server configuration */
     NULL, /* merge server configuration */
 
-    ngx_http_custom_log_create_loc_conf,   /* create location config */
-    ngx_http_custom_log_merge_loc_conf     /* merge location config */
+    ngx_http_custom_log_create_loc_conf,   /* create location configuration */
+    ngx_http_custom_log_merge_loc_conf     /* merge location configuration */
 };
 
-// --------------- Module Definition ---------------
+// -----------------------------------------------------------------------------
+// Module Definition
+// -----------------------------------------------------------------------------
 ngx_module_t ngx_http_custom_log_module = {
     NGX_MODULE_V1,
-    &ngx_http_custom_log_module_ctx,       /* module context */
-    ngx_http_custom_log_commands,          /* module directives */
-    NGX_HTTP_MODULE,                       /* module type */
-    NULL,                                  /* init master */
-    NULL,                                  /* init module */
-    NULL,                                  /* init process */
-    NULL,                                  /* init thread */
-    NULL,                                  /* exit thread */
-    ngx_http_custom_log_exit_process,      /* exit process */
-    NULL,                                  /* exit master */
+    &ngx_http_custom_log_module_ctx,  /* module context */
+    ngx_http_custom_log_commands,     /* module directives */
+    NGX_HTTP_MODULE,                  /* module type */
+    NULL,                             /* init master */
+    NULL,                             /* init module */
+    NULL,                             /* init process */
+    NULL,                             /* init thread */
+    NULL,                             /* exit thread */
+    NULL,                             /* exit process */
+    NULL,                             /* exit master */
     NGX_MODULE_V1_PADDING
 };
 
 // -----------------------------------------------------------------------------
-// Queue Helpers
+// Flush Function: Writes & Removes items from the list
 // -----------------------------------------------------------------------------
-
-// Push node onto queue (tail)
 static void
-queue_push(log_queue_t *q, log_queue_node_t *node)
+ngx_log_fflush(log_shared_info_head_t *head)
 {
-    if (!q || !node) {
+    if (head == NULL || head->inited == 0) {
         return;
     }
-    pthread_mutex_lock(&q->mutex);
-    if (q->tail == NULL) {
-        q->head = node;
-        q->tail = node;
+
+    static ngx_msec_t prevcall_time = 0;
+
+    // If we haven't reached MAX_LIST_BUFFER_SIZE, only flush if enough time has passed
+    if (head->nodes_size < MAX_LIST_BUFFER_SIZE) {
+        if (prevcall_time == 0) {
+            prevcall_time = ngx_time();
+        } else {
+            ngx_msec_t currentcall_time = ngx_time();
+            ngx_msec_t difftime = (currentcall_time - prevcall_time) * 1000;
+            if (difftime < LIST_BUFFER_FLUSH_DEPLAY_MS) {
+                // Not enough time has elapsed yet, skip flushing
+                return;
+            }
+            prevcall_time = currentcall_time;
+        }
     } else {
-        q->tail->next = node;
-        q->tail = node;
-    }
-    q->size++;
-    pthread_mutex_unlock(&q->mutex);
-}
-
-// Pop node from queue (head)
-static log_queue_node_t *
-queue_pop(log_queue_t *q)
-{
-    if (!q) {
-        return NULL;
+        // If we have >= MAX_LIST_BUFFER_SIZE, flush now and reset timer
+        prevcall_time = ngx_time();
     }
 
-    pthread_mutex_lock(&q->mutex);
-    log_queue_node_t *n = q->head;
-    if (n) {
-        q->head = n->next;
-        if (q->head == NULL) {
-            q->tail = NULL;
+#if (NGX_THREADS)
+    pthread_mutex_lock(&mutex);
+#endif
+
+    log_shared_info_t *info = head->begin;
+
+#if (NGX_THREADS)
+    pthread_mutex_unlock(&mutex);
+#endif
+
+    int did_unlock = 0;
+
+    while (info != NULL) {
+        // Acquire lock to read from node safely
+#if (NGX_THREADS)
+        pthread_mutex_lock(&mutex);
+#endif
+
+        // Copy out data needed for write
+        unsigned char line_buffer[NGX_MAX_ERROR_STR];
+        ngx_memzero(line_buffer, NGX_MAX_ERROR_STR);
+
+        size_t data_size = info->datasize;
+        if (data_size > NGX_MAX_ERROR_STR) {
+            data_size = NGX_MAX_ERROR_STR;
         }
-        q->size--;
-    }
-    pthread_mutex_unlock(&q->mutex);
-    return n;
-}
+        ngx_memcpy(line_buffer, info->data, data_size);
 
-// Flush everything in the queue
-static void
-queue_flush_all(log_queue_t *q)
-{
-    if (!q || !q->inited) {
-        return;
-    }
+        // Copy filename
+        unsigned char fname[256];
+        ngx_memzero(fname, sizeof(fname));
+        ngx_memcpy(fname, info->log_filename, sizeof(info->log_filename));
 
-    for (;;) {
-        log_queue_node_t *node = queue_pop(q);
-        if (!node) {
-            break;  // queue empty
-        }
+        log_shared_info_t *delete_node = info;
+        info = info->next;
 
-        // Write log data to file
-        ngx_fd_t fd = ngx_open_file((char *) node->log_filename,
+        // We'll remove from the list after writing
+#if (NGX_THREADS)
+        pthread_mutex_unlock(&mutex);
+#endif
+
+        // Try to open the file
+        ngx_fd_t fd = ngx_open_file((char *)fname,
                                     NGX_FILE_APPEND,
                                     NGX_FILE_CREATE_OR_OPEN,
                                     NGX_FILE_DEFAULT_ACCESS);
-
         if (fd == NGX_INVALID_FILE) {
-            // Log open error
+            // Could not open file
             ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, ngx_errno,
-                          "custom_log: failed to open log file: \"%s\"", node->log_filename);
-            ngx_pfree(q->pool, node);
+                          "custom_log: failed to open \"%s\"", fname);
+
+            // re-lock, remove node from list
+#if (NGX_THREADS)
+            pthread_mutex_lock(&mutex);
+#endif
+            del_info_list(head, delete_node);
+#if (NGX_THREADS)
+            pthread_mutex_unlock(&mutex);
+#endif
             continue;
         }
 
-        // Attempt partial-write loop
-        ssize_t written;
+        // Write out in a partial-write loop
         size_t total_written = 0;
-        while (total_written < node->datasize) {
-            written = ngx_write_fd(fd,
-                                   node->data + total_written,
-                                   node->datasize - total_written);
-            if (written < 0) {
+        while (total_written < data_size) {
+            ssize_t written = ngx_write_fd(fd,
+                                           line_buffer + total_written,
+                                           data_size - total_written);
+            if (written <= 0) {
                 ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, ngx_errno,
-                              "custom_log: write() failed for file \"%s\" after %z bytes",
-                              node->log_filename, total_written);
-                break;
-            } else if (written == 0) {
-                // No more could be written for some reason
-                ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                              "custom_log: write() returned 0 for file \"%s\" after %z bytes",
-                              node->log_filename, total_written);
+                              "custom_log: write() failed for file \"%s\"", fname);
                 break;
             }
             total_written += written;
         }
 
         ngx_close_file(fd);
-        // free the node
-        ngx_pfree(q->pool, node);
+
+        // Now remove node from list
+#if (NGX_THREADS)
+        pthread_mutex_lock(&mutex);
+#endif
+        del_info_list(head, delete_node);
+#if (NGX_THREADS)
+        pthread_mutex_unlock(&mutex);
+#endif
     }
+
+    // End of flush
 }
 
-// The thread function: flush logs every second until stopping
-static void *
-log_thread_func(void *data)
+// -----------------------------------------------------------------------------
+// Initialize the Linked List "head"
+// -----------------------------------------------------------------------------
+static log_shared_info_head_t *
+init_info_list(ngx_conf_t *cf, log_shared_info_head_t *h)
 {
-    log_queue_t *q = (log_queue_t *)data;
+    if (h != NULL && h->inited == 0) {
+        h->pool       = cf->pool;
+        h->nodes_size = 0;
+        h->begin      = NULL;
+        h->end        = NULL;
+        h->inited     = 1;
+        h->pid        = 0;
 
-    while (1) {
-        // Check stopping flag
-        pthread_mutex_lock(&q->mutex);
-        int stop_flag = q->stopping;
-        pthread_mutex_unlock(&q->mutex);
-
-        if (stop_flag) {
-            break;
-        }
-
-        // Flush any queued logs
-        queue_flush_all(q);
-        sleep(1);
+        return h;
     }
-
-    // Final flush if desired
-    queue_flush_all(q);
-
-    // Signal thread has exited
-    pthread_mutex_lock(&q->mutex);
-    q->thread = 0;
-    pthread_mutex_unlock(&q->mutex);
-
     return NULL;
 }
 
 // -----------------------------------------------------------------------------
-// Handler: builds the log line, pushes to the global queue
+// Thread function: flush until the list is empty, then exit
 // -----------------------------------------------------------------------------
-static ngx_int_t ngx_http_custom_log_handler(ngx_http_request_t *r)
+#if (NGX_THREADS)
+static void *
+log_thread_func(void *data)
+{
+    log_shared_info_head_t *head = (log_shared_info_head_t *)data;
+
+    // Keep flushing every 1 second as long as we have items
+    for (;;) {
+        // If no items left, we can exit the thread
+#if (NGX_THREADS)
+        pthread_mutex_lock(&mutex);
+#endif
+        int empty = (head->begin == NULL);
+#if (NGX_THREADS)
+        pthread_mutex_unlock(&mutex);
+#endif
+
+        if (empty) {
+            break;
+        }
+
+        ngx_log_fflush(head);
+        sleep(1);
+    }
+
+    // Mark thread ID 0, so a new thread can be started next time we log
+    head->pid        = 0;
+    head->nodes_size = 0; // or keep it if you prefer
+
+    return NULL;
+}
+#endif // NGX_THREADS
+
+// -----------------------------------------------------------------------------
+// Add a node to the linked list
+// -----------------------------------------------------------------------------
+static log_shared_info_head_t *
+add_info_list(log_shared_info_head_t *head, log_shared_info_t *node)
+{
+    if (head == NULL || head->inited != 1 || node == NULL) {
+        return NULL;
+    }
+
+#if (NGX_THREADS)
+    pthread_mutex_lock(&mutex);
+#endif
+
+    // Allocate a new node on the pool
+    log_shared_info_t *p = ngx_palloc(head->pool, sizeof(log_shared_info_t));
+    if (p == NULL) {
+#if (NGX_THREADS)
+        pthread_mutex_unlock(&mutex);
+#endif
+        return NULL;
+    }
+
+    ngx_memcpy(p, node, sizeof(log_shared_info_t));
+    p->next = NULL;
+
+    if (head->begin == NULL) {
+        // first node in list
+        head->begin = p;
+        head->end   = p;
+    } else {
+        // append to end
+        head->end->next = p;
+        head->end       = p;
+    }
+
+    head->nodes_size++;
+
+#if (NGX_THREADS)
+    pthread_mutex_unlock(&mutex);
+#endif
+
+#if (NGX_THREADS)
+    // Start thread if not already started
+    if (head->pid == 0) {
+        pthread_create(&head->pid, NULL, log_thread_func, head);
+    }
+#endif
+
+    return head;
+}
+
+// -----------------------------------------------------------------------------
+// Delete a node from the linked list
+// -----------------------------------------------------------------------------
+static log_shared_info_head_t *
+del_info_list(log_shared_info_head_t *head, log_shared_info_t *node)
+{
+    if (head == NULL || head->inited != 1 || node == NULL) {
+        return head;
+    }
+
+    // The list is empty
+    if (head->begin == NULL) {
+        return head;
+    }
+
+    // If the first node is the one to delete
+    if (head->begin == node) {
+        log_shared_info_t *delete_node = head->begin;
+        head->begin = delete_node->next;
+        head->nodes_size--;
+
+        // If we removed the last node
+        if (head->begin == NULL) {
+            head->end = NULL;
+        }
+        ngx_pfree(head->pool, delete_node);
+        return head;
+    }
+
+    // Otherwise, find node in the list
+    log_shared_info_t *current_node = head->begin;
+    while (current_node && current_node->next != node) {
+        current_node = current_node->next;
+    }
+    if (current_node == NULL) {
+        // not found
+        return head;
+    }
+
+    // Remove node->next from the chain
+    log_shared_info_t *delete_node = current_node->next;
+    current_node->next = delete_node->next;
+    head->nodes_size--;
+
+    if (delete_node == head->end) {
+        // If we removed the last node
+        head->end = current_node;
+    }
+    ngx_pfree(head->pool, delete_node);
+
+    return head;
+}
+
+// -----------------------------------------------------------------------------
+// The main handler: gather data, build line, push to the linked list
+// -----------------------------------------------------------------------------
+static ngx_int_t
+ngx_http_custom_log_handler(ngx_http_request_t *r)
 {
     ngx_http_custom_log_conf_t *llcf;
     llcf = ngx_http_get_module_loc_conf(r, ngx_http_custom_log_module);
-    if (!llcf) {
-        return NGX_DECLINED;
-    }
-    // skip if type not set
-    if (llcf->type.len == 0) {
+    if (llcf == NULL || llcf->type.len == 0 || r->pool == NULL) {
         return NGX_DECLINED;
     }
 
-    // gather variables
+    // Gather variables
     ngx_str_t time_local        = ngx_string("time_local");
     ngx_str_t request_id        = ngx_string("request_id");
     ngx_str_t username          = ngx_string("username");
+    ngx_str_t sub               = ngx_string("sub");
     ngx_str_t request_platform  = ngx_string("request_platform");
     ngx_str_t geoip_cc          = ngx_string("geoip2_data_country_code");
     ngx_str_t upstream_cache    = ngx_string("upstream_cache_status");
     ngx_str_t challenge_type    = ngx_string("challenge_type");
 
-    ngx_str_t time_local_val       = ngx_null_string;
-    ngx_str_t request_id_val       = ngx_null_string;
-    ngx_str_t username_val         = ngx_null_string;
-    ngx_str_t request_platform_val = ngx_null_string;
-    ngx_str_t geoip_cc_val         = ngx_null_string;
-    ngx_str_t upstream_cache_val   = ngx_null_string;
-    ngx_str_t challenge_type_val   = ngx_null_string;
+    ngx_str_t time_local_value       = ngx_null_string;
+    ngx_str_t request_id_value       = ngx_null_string;
+    ngx_str_t username_value         = ngx_null_string;
+    ngx_str_t sub_value             = ngx_null_string;
+    ngx_str_t request_platform_value = ngx_null_string;
+    ngx_str_t geoip_cc_value        = ngx_null_string;
+    ngx_str_t upstream_cache_value   = ngx_null_string;
+    ngx_str_t challenge_type_value   = ngx_null_string;
 
-    (void) ngx_http_custom_log_get_variable(r, &time_local,       &time_local_val);
-    (void) ngx_http_custom_log_get_variable(r, &request_id,       &request_id_val);
-    (void) ngx_http_custom_log_get_variable(r, &username,         &username_val);
-    (void) ngx_http_custom_log_get_variable(r, &request_platform, &request_platform_val);
-    (void) ngx_http_custom_log_get_variable(r, &geoip_cc,         &geoip_cc_val);
-    (void) ngx_http_custom_log_get_variable(r, &upstream_cache,   &upstream_cache_val);
-    (void) ngx_http_custom_log_get_variable(r, &challenge_type,   &challenge_type_val);
+    (void) ngx_http_custom_log_get_variable(r, &time_local,       &time_local_value);
+    (void) ngx_http_custom_log_get_variable(r, &request_id,       &request_id_value);
+    (void) ngx_http_custom_log_get_variable(r, &username,         &username_value);
+    (void) ngx_http_custom_log_get_variable(r, &sub,              &sub_value);
+    (void) ngx_http_custom_log_get_variable(r, &request_platform, &request_platform_value);
+    (void) ngx_http_custom_log_get_variable(r, &geoip_cc,         &geoip_cc_value);
+    (void) ngx_http_custom_log_get_variable(r, &upstream_cache,   &upstream_cache_value);
+    (void) ngx_http_custom_log_get_variable(r, &challenge_type,   &challenge_type_value);
 
-    if (challenge_type_val.len == 0) {
-        static ngx_str_t default_challenge_type = ngx_string("dynamic");
-        challenge_type_val = default_challenge_type;
-    }
+    // Build the log line
+    u_char log_line[NGX_MAX_ERROR_STR];
+    ngx_memzero(log_line, NGX_MAX_ERROR_STR);
 
-    // referer / user-agent
-    ngx_str_t referer_value    = ngx_null_string;
-    ngx_str_t user_agent_value = ngx_null_string;
-    if (r->headers_in.referer) {
-        referer_value = r->headers_in.referer->value;
-    }
-    if (r->headers_in.user_agent) {
-        user_agent_value = r->headers_in.user_agent->value;
-    }
+    // Trim and sanitize referer, user-agent, etc.
+    ngx_str_t referer_value    = (r->headers_in.referer)    ? r->headers_in.referer->value    : ngx_null_string;
+    ngx_str_t user_agent_value = (r->headers_in.user_agent) ? r->headers_in.user_agent->value : ngx_null_string;
 
-    // Trim
     if (referer_value.len > HEADER_REFRERER_LEN_LIMIT) {
         referer_value.len = HEADER_REFRERER_LEN_LIMIT;
         referer_value.data[HEADER_REFRERER_LEN_LIMIT] = '\0';
@@ -312,20 +481,8 @@ static ngx_int_t ngx_http_custom_log_handler(ngx_http_request_t *r)
         user_agent_value.len = HEADER_USER_AGENT_LEN_LIMIT;
         user_agent_value.data[HEADER_USER_AGENT_LEN_LIMIT] = '\0';
     }
-    if (r->unparsed_uri.len > HEADER_UNPARSED_URI_LEN_LIMIT) {
-        r->unparsed_uri.len = HEADER_UNPARSED_URI_LEN_LIMIT;
-        r->unparsed_uri.data[HEADER_UNPARSED_URI_LEN_LIMIT] = '\0';
-    }
-    if (r->method_name.len > METHOD_NAME_LEN_LIMIT) {
-        r->method_name.len = METHOD_NAME_LEN_LIMIT;
-        r->method_name.data[METHOD_NAME_LEN_LIMIT] = '\0';
-    }
-    if (llcf->custom_data.len > OTHER_CUSTOM_DATA_LEN_LIMIT) {
-        llcf->custom_data.len = OTHER_CUSTOM_DATA_LEN_LIMIT;
-        llcf->custom_data.data[OTHER_CUSTOM_DATA_LEN_LIMIT] = '\0';
-    }
 
-    // sanitize
+    // sanitize them
     unsigned char *fmt = FormattingCorrectionStrings(r->pool, referer_value.data, referer_value.len);
     if (fmt) {
         referer_value.data = fmt;
@@ -338,164 +495,163 @@ static ngx_int_t ngx_http_custom_log_handler(ngx_http_request_t *r)
         user_agent_value.len  = ngx_strlen(fmt);
     }
 
+    if (r->unparsed_uri.len > HEADER_UNPARSED_URI_LEN_LIMIT) {
+        r->unparsed_uri.len = HEADER_UNPARSED_URI_LEN_LIMIT;
+        r->unparsed_uri.data[HEADER_UNPARSED_URI_LEN_LIMIT] = '\0';
+    }
+    if (r->method_name.len > METHOD_NAME_LEN_LIMIT) {
+        r->method_name.len = METHOD_NAME_LEN_LIMIT;
+        r->method_name.data[METHOD_NAME_LEN_LIMIT] = '\0';
+    }
+
+    // sanitize method
     fmt = FormattingCorrectionStrings(r->pool, r->method_name.data, r->method_name.len);
     if (fmt) {
         r->method_name.data = fmt;
         r->method_name.len  = ngx_strlen(fmt);
     }
 
+    // sanitize custom_data
+    if (llcf->custom_data.len > OTHER_CUSTOM_DATA_LEN_LIMIT) {
+        llcf->custom_data.len = OTHER_CUSTOM_DATA_LEN_LIMIT;
+        llcf->custom_data.data[OTHER_CUSTOM_DATA_LEN_LIMIT] = '\0';
+    }
     fmt = FormattingCorrectionStrings(r->pool, llcf->custom_data.data, llcf->custom_data.len);
     if (fmt) {
         llcf->custom_data.data = fmt;
         llcf->custom_data.len  = ngx_strlen(fmt);
     }
 
-    // if you want to wrap custom_data: "value"-"
+    // Possibly wrap "custom_data"
     if (llcf->custom_data.len > 0) {
-        // Allocate enough bytes from r->pool: original length + 3 for "\"-\"" + null-terminator
-        size_t needed = llcf->custom_data.len + 3 + 1;
-        u_char *p = ngx_pnalloc(r->pool, needed);
-        if (p == NULL) {
-            return NGX_ERROR; // handle allocation error
-        }
-
-        ngx_memzero(p, needed);
-        ngx_sprintf(p, "%V\"-\"", &llcf->custom_data);
-
-        llcf->custom_data.len  = ngx_strlen(p);
-        llcf->custom_data.data = p;
+        static u_char custom_tmp[OTHER_CUSTOM_DATA_LEN_LIMIT+4];
+        ngx_memzero(custom_tmp, sizeof(custom_tmp));
+        ngx_sprintf(custom_tmp, "%V\"-\"", &llcf->custom_data);
+        llcf->custom_data.len  = ngx_strlen(custom_tmp);
+        llcf->custom_data.data = custom_tmp;
     }
 
-    // build log line
-    u_char log_line[NGX_MAX_ERROR_STR];
-    ngx_memzero(log_line, sizeof(log_line));
-    u_char *line_end = log_line;
-
-    if (ngx_strncmp(llcf->type.data, "challenge", 9) == 0) {
-        line_end = ngx_slprintf(log_line, log_line + sizeof(log_line) - 1,
+    // Build the line
+    u_char *line_end = NULL;
+    if (ngx_strcmp(llcf->type.data, "challenge") == 0) {
+        line_end = ngx_slprintf(log_line, log_line + NGX_MAX_ERROR_STR - 1,
             "\"%V\"-\"%V\"-\"%V\"-\"%V\"-\"%V\"-\"%V\"-\"%ui\"-\"%V\"-\"%V\"-\"%V\"-\"%V%V\"\n",
-            &time_local_val,
-            &request_id_val,
+            &time_local_value,
+            &request_id_value,
             &r->connection->addr_text,
             &r->method_name,
             &r->unparsed_uri,
-            &challenge_type_val,
+            &challenge_type_value,
             r->headers_out.status,
             &referer_value,
-            &request_platform_val,
-            &geoip_cc_val,
+            &request_platform_value,
+            &geoip_cc_value,
             &llcf->custom_data,
             &user_agent_value
         );
     }
-    else if (ngx_strncmp(llcf->type.data, "waf", 3) == 0) {
-        line_end = ngx_slprintf(log_line, log_line + sizeof(log_line) - 1,
+    else if (ngx_strcmp(llcf->type.data, "waf") == 0) {
+        line_end = ngx_slprintf(log_line, log_line + NGX_MAX_ERROR_STR - 1,
             "\"%V\"-\"%V\"-\"%V\"-\"%V\"-\"%V\"-\"%ui\"-\"%O\"-\"%V\"-\"%V\"-\"%V\"-\"%V%V\"\n",
-            &time_local_val,
-            &request_id_val,
+            &time_local_value,
+            &request_id_value,
             &r->connection->addr_text,
             &r->method_name,
             &r->unparsed_uri,
             r->headers_out.status,
             r->connection->sent,
             &referer_value,
-            &request_platform_val,
-            &geoip_cc_val,
+            &request_platform_value,
+            &geoip_cc_value,
             &llcf->custom_data,
             &user_agent_value
         );
     }
     else {
         // fallback
-        line_end = ngx_slprintf(log_line, log_line + sizeof(log_line) - 1,
+        line_end = ngx_slprintf(log_line, log_line + NGX_MAX_ERROR_STR - 1,
             "\"%V\"-\"%V\"-\"%V\"-\"%V\"-\"%V\"-\"%ui\"-\"%O\"-\"%V\"-\"%V\"-\"%V\"-\"%V\"-\"%V%V\"\n",
-            &time_local_val,
-            &request_id_val,
+            &time_local_value,
+            &request_id_value,
             &r->connection->addr_text,
             &r->method_name,
             &r->unparsed_uri,
             r->headers_out.status,
             r->connection->sent,
             &referer_value,
-            &request_platform_val,
-            &geoip_cc_val,
-            &upstream_cache_val,
+            &request_platform_value,
+            &geoip_cc_value,
+            &upstream_cache_value,
             &llcf->custom_data,
             &user_agent_value
         );
     }
 
-    // build path to log file
+    // Build the filename
     ngx_str_t log_filename;
-    ngx_memzero(&log_filename, sizeof(log_filename));
-
     ngx_str_t log_folder;
     ngx_str_t log_format;
 
-    if (username_val.len > 0) {
+    if (username_value.len > 0) {
         ngx_str_set(&log_folder, "/proginter/config/users/");
-        ngx_str_set(&log_format, "/logs/last/%V.log");
+
+        if (sub_value.len > 0) {
+            ngx_str_set(&log_format, "/domain/subs/%V/logs/last/%V.log");
+        } else {
+            ngx_str_set(&log_format, "/logs/last/%V.log");
+        }
     } else {
         ngx_str_set(&log_folder, "/var/log/nginx/");
         ngx_str_set(&log_format, "/%V.log");
     }
 
-    size_t path_len = log_folder.len + username_val.len
-                      + log_format.len + llcf->type.len + 1;
-    // Check for potential overflow in qnode->log_filename
-    if (path_len >= LOG_FILENAME_MAX_LEN) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "custom_log: resulting log path too long (%uz >= %d), skipping",
-                      path_len, LOG_FILENAME_MAX_LEN);
-        return NGX_DECLINED;
-    }
-
-    log_filename.data = ngx_pnalloc(r->pool, path_len);
-    if (!log_filename.data) {
+    // Allocate enough for folder + user + sub + type + ".log"
+    size_t fname_size = log_folder.len + username_value.len + log_format.len
+                      + llcf->type.len + sub_value.len + 32; // safety margin
+    log_filename.data = ngx_pnalloc(r->pool, fname_size);
+    if (log_filename.data == NULL) {
         return NGX_ERROR;
     }
-    ngx_memzero(log_filename.data, path_len);
+    ngx_memzero(log_filename.data, fname_size);
 
     ngx_memcpy(log_filename.data, log_folder.data, log_folder.len);
-    if (username_val.len > 0) {
+    if (username_value.len > 0) {
         ngx_memcpy(log_filename.data + log_folder.len,
-                   username_val.data, username_val.len);
+                   username_value.data, username_value.len);
     }
 
-    ngx_sprintf(log_filename.data + log_folder.len + username_val.len,
-                (char *) log_format.data, &llcf->type);
+    if (sub_value.len > 0) {
+        ngx_sprintf(log_filename.data + log_folder.len + username_value.len,
+                    (char *) log_format.data, &sub_value, &llcf->type);
+    } else {
+        ngx_sprintf(log_filename.data + log_folder.len + username_value.len,
+                    (char *) log_format.data, &llcf->type);
+    }
     log_filename.len = ngx_strlen(log_filename.data);
 
-    if (!g_queue) {
-        return NGX_ERROR;  // shouldn't happen if module init succeeded
-    }
+    // Build the node to add
+    log_shared_info_t node;
+    ngx_memzero(&node, sizeof(node));
 
-    // Allocate a node from the global queue pool
-    log_queue_node_t *qnode = ngx_pcalloc(g_queue->pool, sizeof(log_queue_node_t));
-    if (!qnode) {
+    size_t copy_len = (line_end - log_line);
+    if (copy_len > sizeof(node.data)) {
+        copy_len = sizeof(node.data);
+    }
+    ngx_memcpy(node.data, log_line, copy_len);
+    node.datasize = copy_len;
+
+    size_t fname_cpy_len = (log_filename.len < sizeof(node.log_filename))
+                           ? log_filename.len
+                           : (sizeof(node.log_filename) - 1);
+    ngx_memcpy(node.log_filename, log_filename.data, fname_cpy_len);
+    node.log_filename[fname_cpy_len] = '\0';
+
+    // Add to the list
+    if (add_info_list(head, &node) == NULL) {
         return NGX_ERROR;
     }
 
-    // Copy log line
-    size_t msg_len = (size_t)(line_end - log_line);
-    if (msg_len > sizeof(qnode->data)) {
-        msg_len = sizeof(qnode->data);
-    }
-    ngx_memcpy(qnode->data, log_line, msg_len);
-    qnode->datasize = msg_len;
-
-    // Copy filename
-    size_t fname_len = (log_filename.len < (LOG_FILENAME_MAX_LEN - 1))
-                       ? log_filename.len
-                       : (LOG_FILENAME_MAX_LEN - 1);
-    ngx_memcpy(qnode->log_filename, log_filename.data, fname_len);
-    qnode->log_filename[fname_len] = '\0';
-    qnode->next = NULL;
-
-    // Push to queue
-    queue_push(g_queue, qnode);
-
-    // If was set via Lua, optionally free those strings:
+    // If set via Lua, free the strings
     if (llcf->lua) {
         ngx_pfree(r->pool, llcf->type.data);
         ngx_pfree(r->pool, llcf->custom_data.data);
@@ -503,19 +659,19 @@ static ngx_int_t ngx_http_custom_log_handler(ngx_http_request_t *r)
         llcf->type.len         = 0;
         llcf->custom_data.data = NULL;
         llcf->custom_data.len  = 0;
-        llcf->lua = 0;
+        llcf->lua              = 0;
     }
 
 #if !(NGX_THREADS)
-    // If not using threads, flush synchronously
-    queue_flush_all(g_queue);
+    // If not using threads, flush synchronously every request
+    ngx_log_fflush(head);
 #endif
 
     return NGX_OK;
 }
 
 // -----------------------------------------------------------------------------
-// String Formatting Correction
+// Helper: remove unwanted chars
 // -----------------------------------------------------------------------------
 static unsigned char *
 FormattingCorrectionStrings(ngx_pool_t *pool, unsigned char *raw, size_t length)
@@ -523,9 +679,9 @@ FormattingCorrectionStrings(ngx_pool_t *pool, unsigned char *raw, size_t length)
     if (!raw || length == 0) {
         return NULL;
     }
-    // +1 for null terminator
-    unsigned char *newstr = ngx_pcalloc(pool, length + 1);
-    if (!newstr) {
+
+    unsigned char *new_str = ngx_pcalloc(pool, length + 1);
+    if (new_str == NULL) {
         return NULL;
     }
 
@@ -534,29 +690,28 @@ FormattingCorrectionStrings(ngx_pool_t *pool, unsigned char *raw, size_t length)
         if (raw[i] != '\n' && raw[i] != '\t' &&
             raw[i] != '\r' && raw[i] != '\"')
         {
-            newstr[line_length++] = raw[i];
+            new_str[line_length++] = raw[i];
         }
     }
-    newstr[line_length] = '\0';
-    return newstr;
+    new_str[line_length] = '\0';
+    return new_str;
 }
 
 // -----------------------------------------------------------------------------
-// Location Config
+// Create + Merge Loc Conf
 // -----------------------------------------------------------------------------
 static void *
 ngx_http_custom_log_create_loc_conf(ngx_conf_t *cf)
 {
-    ngx_http_custom_log_conf_t *conf;
-    conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_custom_log_conf_t));
-    if (!conf) {
+    ngx_http_custom_log_conf_t *conf = ngx_pcalloc(cf->pool, sizeof(*conf));
+    if (conf == NULL) {
         return NULL;
     }
-    conf->type.len        = 0;
-    conf->type.data       = NULL;
-    conf->custom_data.len = 0;
+    conf->type.len         = 0;
+    conf->type.data        = NULL;
+    conf->custom_data.len  = 0;
     conf->custom_data.data = NULL;
-    conf->lua = 0;
+    conf->lua              = 0;
     return conf;
 }
 
@@ -568,60 +723,48 @@ ngx_http_custom_log_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     ngx_conf_merge_str_value(conf->type,        prev->type,        "");
     ngx_conf_merge_str_value(conf->custom_data, prev->custom_data, "");
+
     return NGX_CONF_OK;
 }
 
 // -----------------------------------------------------------------------------
-// Post-Configuration Init
+// Module Init: Register handler + init head + possibly set up Lua preload
 // -----------------------------------------------------------------------------
-static ngx_int_t ngx_http_custom_log_init(ngx_conf_t *cf)
+static ngx_int_t
+ngx_http_custom_log_init(ngx_conf_t *cf)
 {
-    // Create a pool that lasts the worker's lifetime
-    ngx_pool_t *pool = ngx_create_pool(8192, cf->log);
-    if (!pool) {
+    // Register the custom log handler in the LOG phase
+    ngx_http_core_main_conf_t *cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
+    if (cmcf == NULL) {
         return NGX_ERROR;
     }
 
-    g_queue = ngx_pcalloc(pool, sizeof(log_queue_t));
-    if (!g_queue) {
-        ngx_destroy_pool(pool);
-        return NGX_ERROR;
-    }
-
-    g_queue->pool     = pool;
-    g_queue->head     = NULL;
-    g_queue->tail     = NULL;
-    g_queue->size     = 0;
-    g_queue->inited   = 1;
-    g_queue->stopping = 0;
-
-    pthread_mutex_init(&g_queue->mutex, NULL);
-
-    // Register the custom log handler in the log phase
-    ngx_http_core_main_conf_t *cmcf;
-    cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
-    if (!cmcf) {
-        return NGX_ERROR;
-    }
-
-    ngx_http_handler_pt *h;
-    h = ngx_array_push(&cmcf->phases[NGX_HTTP_LOG_PHASE].handlers);
-    if (!h) {
+    ngx_http_handler_pt *h = ngx_array_push(&cmcf->phases[NGX_HTTP_LOG_PHASE].handlers);
+    if (h == NULL) {
         return NGX_ERROR;
     }
     *h = ngx_http_custom_log_handler;
 
-#if (NGX_THREADS)
-    // Start background flush thread
-    if (pthread_create(&g_queue->thread, NULL, log_thread_func, g_queue) != 0) {
+    // Allocate the global head structure
+    if (head != NULL) {
+        head = NULL; // reset
+    }
+
+    head = ngx_palloc(cf->pool, sizeof(log_shared_info_head_t));
+    if (head == NULL) {
         return NGX_ERROR;
     }
-#endif
+    ngx_memzero(head, sizeof(*head));
+
+    // Initialize it
+    if (init_info_list(cf, head) == NULL) {
+        return NGX_ERROR;
+    }
 
 #ifdef LOG_IF_LUA_SUPPORT
-    // Expose Lua function: require("ngx.custom_log").log_type(...)
+    // Register the Lua function: require "ngx.custom_log"
     if (ngx_http_lua_add_package_preload(cf, "ngx.custom_log",
-                ngx_http_lua_custom_log_register_function) != NGX_OK)
+                                         ngx_http_lua_custom_log_register_function) != NGX_OK)
     {
         return NGX_ERROR;
     }
@@ -631,40 +774,7 @@ static ngx_int_t ngx_http_custom_log_init(ngx_conf_t *cf)
 }
 
 // -----------------------------------------------------------------------------
-// Graceful Shutdown (exit_process)
-// -----------------------------------------------------------------------------
-static void
-ngx_http_custom_log_exit_process(ngx_cycle_t *cycle)
-{
-    if (!g_queue) {
-        return;
-    }
-
-    if (g_queue->inited) {
-        // Signal the flush thread to stop
-        pthread_mutex_lock(&g_queue->mutex);
-        g_queue->stopping = 1;
-        pthread_mutex_unlock(&g_queue->mutex);
-
-        // Wait for thread to exit (if it was started)
-        if (g_queue->thread) {
-            pthread_join(g_queue->thread, NULL);
-            g_queue->thread = 0;
-        }
-
-        // Final flush of any leftover items
-        queue_flush_all(g_queue);
-
-        // Cleanup
-        pthread_mutex_destroy(&g_queue->mutex);
-
-        ngx_destroy_pool(g_queue->pool);
-        g_queue = NULL;
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Command Handler for 'log_type'
+// Directive 'log_type' handler
 // -----------------------------------------------------------------------------
 static char *
 ngx_http_custom_log_set_type(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
@@ -672,16 +782,16 @@ ngx_http_custom_log_set_type(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_http_custom_log_conf_t *llcf = conf;
     ngx_str_t *value = cf->args->elts;
 
-    if (!llcf) {
+    if (llcf == NULL) {
         return NGX_CONF_ERROR;
     }
 
     // Validate the first argument
-    if (ngx_strcmp(value[1].data, "dynamic")   != 0 &&
-        ngx_strcmp(value[1].data, "static")    != 0 &&
-        ngx_strcmp(value[1].data, "ajax")      != 0 &&
-        ngx_strcmp(value[1].data, "waf")       != 0 &&
-        ngx_strcmp(value[1].data, "challenge") != 0)
+    if (strcmp((char *)value[1].data, "dynamic") != 0 &&
+        strcmp((char *)value[1].data, "static")  != 0 &&
+        strcmp((char *)value[1].data, "ajax")    != 0 &&
+        strcmp((char *)value[1].data, "waf")     != 0 &&
+        strcmp((char *)value[1].data, "challenge") != 0)
     {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "invalid log_type value \"%V\"", &value[1]);
@@ -696,12 +806,12 @@ ngx_http_custom_log_set_type(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 // -----------------------------------------------------------------------------
-// Helper: Get Variable by Name
+// Helper: Get an Nginx variable by name
 // -----------------------------------------------------------------------------
 static ngx_int_t
 ngx_http_custom_log_get_variable(ngx_http_request_t *r, ngx_str_t *name, ngx_str_t *value)
 {
-    if (!r || !name) {
+    if (r == NULL || name == NULL) {
         return NGX_ERROR;
     }
 
@@ -710,13 +820,13 @@ ngx_http_custom_log_get_variable(ngx_http_request_t *r, ngx_str_t *name, ngx_str
         return NGX_ERROR;
     }
 
-    ngx_http_variable_value_t *vv = ngx_http_get_variable(r, name, key);
-    if (!vv || vv->not_found || !vv->data) {
+    ngx_http_variable_value_t *v = ngx_http_get_variable(r, name, key);
+    if (v == NULL || v->not_found || v->data == NULL) {
         return NGX_ERROR;
     }
 
-    value->len  = vv->len;
-    value->data = vv->data;
+    value->len  = v->len;
+    value->data = v->data;
     return NGX_OK;
 }
 
@@ -726,7 +836,7 @@ ngx_http_custom_log_get_variable(ngx_http_request_t *r, ngx_str_t *name, ngx_str
 #ifdef LOG_IF_LUA_SUPPORT
 
 static int
-ngx_http_lua_custom_log_register_function(lua_State *L)
+ngx_http_lua_custom_log_register_function(lua_State * L)
 {
     lua_createtable(L, 0, 1);
     lua_pushcfunction(L, ngx_http_lua_custom_log_set_type);
@@ -735,45 +845,41 @@ ngx_http_lua_custom_log_register_function(lua_State *L)
 }
 
 static int
-ngx_http_lua_custom_log_set_type(lua_State *L)
+ngx_http_lua_custom_log_set_type(lua_State * L)
 {
     if (lua_gettop(L) != 2) {
         return luaL_error(L, "exactly 2 arguments expected");
     }
-
     const char *type  = luaL_checkstring(L, 1);
     const char *value = luaL_checkstring(L, 2);
 
     ngx_http_request_t *r = ngx_http_lua_get_request(L);
-    if (!r) {
+    if (r == NULL) {
         return luaL_error(L, "no request object found");
     }
 
-    ngx_http_custom_log_conf_t *llcf;
-    llcf = ngx_http_get_module_loc_conf(r, ngx_http_custom_log_module);
-    if (!llcf) {
+    ngx_http_custom_log_conf_t *llcf = ngx_http_get_module_loc_conf(r, ngx_http_custom_log_module);
+    if (llcf == NULL) {
         return 0;
     }
 
-    // copy strings into llcf
-    size_t tlen = ngx_strlen(type);
-    llcf->type.data = ngx_pnalloc(r->pool, tlen + 1);
+    llcf->type.data = ngx_pnalloc(r->pool, strlen(type)+1);
     if (!llcf->type.data) {
-        return luaL_error(L, "out of memory for type");
+        return luaL_error(L, "no memory for type");
     }
-    ngx_cpystrn(llcf->type.data, (u_char *)type, tlen + 1);
-    llcf->type.len = tlen;
+    ngx_memcpy(llcf->type.data, type, strlen(type));
+    llcf->type.data[strlen(type)] = '\0';
+    llcf->type.len = strlen(type);
 
-    size_t vlen = ngx_strlen(value);
-    llcf->custom_data.data = ngx_pnalloc(r->pool, vlen + 1);
+    llcf->custom_data.data = ngx_pnalloc(r->pool, strlen(value)+1);
     if (!llcf->custom_data.data) {
-        return luaL_error(L, "out of memory for custom_data");
+        return luaL_error(L, "no memory for custom_data");
     }
-    ngx_cpystrn(llcf->custom_data.data, (u_char *)value, vlen + 1);
-    llcf->custom_data.len = vlen;
+    ngx_memcpy(llcf->custom_data.data, value, strlen(value));
+    llcf->custom_data.data[strlen(value)] = '\0';
+    llcf->custom_data.len = strlen(value);
 
     llcf->lua = 1;
-
     lua_pushboolean(L, 1);
     return 1;
 }
