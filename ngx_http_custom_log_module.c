@@ -16,12 +16,13 @@
 #endif
 
 // --------------- Constants ---------------
-#define MAX_LOG_LINE_LEN             4096
-#define HEADER_USER_AGENT_LEN_LIMIT  350
-#define HEADER_UNPARSED_URI_LEN_LIMIT 350
-#define METHOD_NAME_LEN_LIMIT        20
-#define OTHER_CUSTOM_DATA_LEN_LIMIT  100
-#define HEADER_REFRERER_LEN_LIMIT    100
+#define MAX_LOG_LINE_LEN               4096
+#define HEADER_USER_AGENT_LEN_LIMIT    350
+#define HEADER_UNPARSED_URI_LEN_LIMIT  350
+#define METHOD_NAME_LEN_LIMIT          20
+#define OTHER_CUSTOM_DATA_LEN_LIMIT    100
+#define HEADER_REFRERER_LEN_LIMIT      100
+#define LOG_FILENAME_MAX_LEN           1024   // Increased size for filename path
 
 // --------------- Module Location Conf ---------------
 typedef struct {
@@ -33,20 +34,20 @@ typedef struct {
 // --------------- Queue Structures ---------------
 typedef struct log_queue_node_s {
     u_char data[NGX_MAX_ERROR_STR];
-    u_char log_filename[256];
+    u_char log_filename[LOG_FILENAME_MAX_LEN];
     size_t datasize;
     struct log_queue_node_s *next;
 } log_queue_node_t;
 
 typedef struct {
-    ngx_pool_t         *pool;
-    log_queue_node_t   *head;
-    log_queue_node_t   *tail;
-    size_t              size;
-    pthread_mutex_t     mutex;
-    pthread_t           thread;
-    int                 inited;
-    int                 stopping;
+    ngx_pool_t       *pool;
+    log_queue_node_t *head;
+    log_queue_node_t *tail;
+    size_t            size;
+    pthread_mutex_t   mutex;
+    pthread_t         thread;
+    int               inited;
+    int               stopping;
 } log_queue_t;
 
 // --------------- Global Queue Pointer (per worker) ---------------
@@ -166,6 +167,7 @@ queue_flush_all(log_queue_t *q)
     if (!q || !q->inited) {
         return;
     }
+
     for (;;) {
         log_queue_node_t *node = queue_pop(q);
         if (!node) {
@@ -173,16 +175,42 @@ queue_flush_all(log_queue_t *q)
         }
 
         // Write log data to file
-        ngx_fd_t fd = ngx_open_file(node->log_filename,
+        ngx_fd_t fd = ngx_open_file((char *) node->log_filename,
                                     NGX_FILE_APPEND,
                                     NGX_FILE_CREATE_OR_OPEN,
                                     NGX_FILE_DEFAULT_ACCESS);
 
-        if (fd != NGX_INVALID_FILE) {
-            ngx_write_fd(fd, node->data, node->datasize);
-            ngx_close_file(fd);
+        if (fd == NGX_INVALID_FILE) {
+            // Log open error
+            ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, ngx_errno,
+                          "custom_log: failed to open log file: \"%s\"", node->log_filename);
+            ngx_pfree(q->pool, node);
+            continue;
         }
 
+        // Attempt partial-write loop
+        ssize_t written;
+        size_t total_written = 0;
+        while (total_written < node->datasize) {
+            written = ngx_write_fd(fd,
+                                   node->data + total_written,
+                                   node->datasize - total_written);
+            if (written < 0) {
+                ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, ngx_errno,
+                              "custom_log: write() failed for file \"%s\" after %z bytes",
+                              node->log_filename, total_written);
+                break;
+            } else if (written == 0) {
+                // No more could be written for some reason
+                ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                              "custom_log: write() returned 0 for file \"%s\" after %z bytes",
+                              node->log_filename, total_written);
+                break;
+            }
+            total_written += written;
+        }
+
+        ngx_close_file(fd);
         // free the node
         ngx_pfree(q->pool, node);
     }
@@ -260,7 +288,7 @@ static ngx_int_t ngx_http_custom_log_handler(ngx_http_request_t *r)
     (void) ngx_http_custom_log_get_variable(r, &upstream_cache,   &upstream_cache_val);
     (void) ngx_http_custom_log_get_variable(r, &challenge_type,   &challenge_type_val);
 
-      if (challenge_type_val.len == 0) {
+    if (challenge_type_val.len == 0) {
         static ngx_str_t default_challenge_type = ngx_string("dynamic");
         challenge_type_val = default_challenge_type;
     }
@@ -322,7 +350,7 @@ static ngx_int_t ngx_http_custom_log_handler(ngx_http_request_t *r)
         llcf->custom_data.len  = ngx_strlen(fmt);
     }
 
-    // if you want to wrap custom_data: "value"-
+    // if you want to wrap custom_data: "value"-"
     if (llcf->custom_data.len > 0) {
         // Allocate enough bytes from r->pool: original length + 3 for "\"-\"" + null-terminator
         size_t needed = llcf->custom_data.len + 3 + 1;
@@ -330,10 +358,10 @@ static ngx_int_t ngx_http_custom_log_handler(ngx_http_request_t *r)
         if (p == NULL) {
             return NGX_ERROR; // handle allocation error
         }
-    
+
         ngx_memzero(p, needed);
         ngx_sprintf(p, "%V\"-\"", &llcf->custom_data);
-    
+
         llcf->custom_data.len  = ngx_strlen(p);
         llcf->custom_data.data = p;
     }
@@ -413,7 +441,15 @@ static ngx_int_t ngx_http_custom_log_handler(ngx_http_request_t *r)
     }
 
     size_t path_len = log_folder.len + username_val.len
-                    + log_format.len + llcf->type.len + 1;
+                      + log_format.len + llcf->type.len + 1;
+    // Check for potential overflow in qnode->log_filename
+    if (path_len >= LOG_FILENAME_MAX_LEN) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "custom_log: resulting log path too long (%uz >= %d), skipping",
+                      path_len, LOG_FILENAME_MAX_LEN);
+        return NGX_DECLINED;
+    }
+
     log_filename.data = ngx_pnalloc(r->pool, path_len);
     if (!log_filename.data) {
         return NGX_ERROR;
@@ -449,9 +485,9 @@ static ngx_int_t ngx_http_custom_log_handler(ngx_http_request_t *r)
     qnode->datasize = msg_len;
 
     // Copy filename
-    size_t fname_len = (log_filename.len < sizeof(qnode->log_filename) - 1)
+    size_t fname_len = (log_filename.len < (LOG_FILENAME_MAX_LEN - 1))
                        ? log_filename.len
-                       : (sizeof(qnode->log_filename) - 1);
+                       : (LOG_FILENAME_MAX_LEN - 1);
     ngx_memcpy(qnode->log_filename, log_filename.data, fname_len);
     qnode->log_filename[fname_len] = '\0';
     qnode->next = NULL;
